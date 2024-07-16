@@ -1,0 +1,193 @@
+class SMBNetworkShare(NetworkShare):
+
+    def __init__(self, smb_details: tuple) -> None:
+
+        self.smb_details = smb_details
+        if self.smb_details != None:
+            self.smbServerIp = self.smb_details[0]
+            self.smbUser = "Admin"
+            self.smbPassword = loader.GSP_NET_PASSWD
+            self.smbPort = self.smb_details[1]
+            self.smbClientName = self.smb_details[2]
+            self.smbServerName = self.smb_details[3]
+            self.smbShareName = self.smb_details[4]
+            self.smbDstFolderPrefix = self.smb_details[5]
+
+    def __open_connection(self) -> None:
+        for use_ntlm_v2 in [True, False]:
+            try:
+                self.conn = SMBConnection(self.smbUser, self.smbPassword, self.smbClientName, self.smbServerName, use_ntlm_v2=use_ntlm_v2, is_direct_tcp=True)
+                self.isConnected = self.conn.connect(self.smbServerIp, self.smbPort)
+                if self.isConnected == True:
+                    logger.info("Connected SMB server successfully!")
+                    break
+                else:
+                    logger.warning("Connection attempt failure!. Current value of use_ntlm_v2 is ", {use_ntlm_v2})
+
+            except Exception as ex:
+                logger.exception("Exception while connecting to SMB server: " + str(ex))
+
+    def __enumerate_smbfiles(self, remoteDir: str, recCall: bool=False) -> list:
+        fileList: list = []
+        if remoteDir.startswith(self.smbShareName):
+            remoteDir = remoteDir.replace(self.smbShareName, '', 1)
+
+        if recCall==False:
+            remoteServerPath = os.path.join(self.smbDstFolderPrefix, remoteDir).replace("/", "\\")
+
+            try:
+                smbSharedFile = self.conn.listPath(self.smbShareName, remoteServerPath, search=65591, pattern='*', timeout=30)
+                if not smbSharedFile:
+                    logger.info("No files found in the smb server. Dir. name: " + smbSharedFile)
+                    return fileList
+
+                for fileObj in smbSharedFile:
+                    if fileObj.filename != '.' and fileObj.filename != '..':
+                        if fileObj.isDirectory:
+                            for filename in self.__enumerate_smbfiles(os.path.join(remoteServerPath, fileObj.filename), True):
+                                fileList.append(os.path.join(fileObj.filename, filename))
+                        else:
+                            fileList.append(fileObj.filename)
+            except Exception as ex:
+                logger.warning("Failed to retrieve smb file list: " + str(ex))
+
+            return fileList
+
+    def __download_file(self, localDir: str, remoteDir: str, filename: str) -> None:
+
+        if remoteDir.startswith(self.smbShareName):
+            remoteDir = remoteDir.replace(self.smbShareName, '', 1)
+
+        localPath = os.path.join(localDir, filename)
+        remoteServerPath = os.path.join(self.smbDstFolderPrefix, remoteDir, filename).replace("/", "\\")
+
+        remaining_attempts = 3
+        smbcopy_needs_to_be_repeated = True
+
+        while smbcopy_needs_to_be_repeated and remaining_attempts > 0:
+            remaining_attempts -= 1
+            try:
+                with open(localPath, 'wb') as file_obj:
+                    file_attributes, remote_file_size = self.conn.retrieveFile(self.smbShareName, remoteServerPath,
+                                                                               file_obj, timeout=120)
+                    file_obj.close()
+            except Exception as ex:
+                logger.error("Unable to open file: " + localPath + ". Error: " + str(ex))
+                return
+
+            local_file_size = os.path.getsize(localPath)
+
+            if remote_file_size == local_file_size:
+                smbcopy_needs_to_be_repeated = False
+                break
+        if smbcopy_needs_to_be_repeated:
+            raise RuntimeError(
+                    "Smb Copy indicated that it needs to be repeated, but repeating it several times did not help."
+                )
+
+    def copy_to(self, srcDir: str, targetDir: str) -> None:
+
+        try:
+            self.__open_connection()
+            if self.isConnected == False:
+                logger.warning("SMB Connection Failure!!!")
+                return
+
+            fileList = self.__enumerate_smbfiles(srcDir)
+            for filename in fileList:
+                parent_dir = os.path.dirname(os.path.join(targetDir, filename))
+                os.makedirs(parent_dir, mode=0o777, exist_ok=True)
+
+                self.__download_file(targetDir, srcDir, filename)
+        finally:
+            self.__close_connection()
+
+    def __create_remote_directory(self, remoteDir: str, sub_dir_path: str) -> None:
+
+        if remoteDir.startswith(self.smbShareName):
+            remoteDir = remoteDir.replace(self.smbShareName, '', 1)
+
+        relative_dir_path = os.path.join(self.smbDstFolderPrefix, remoteDir, sub_dir_path).replace("/", "\\")
+        try:
+            try:
+                self.conn.listPath(self.smbShareName, relative_dir_path)
+                return
+            except Exception as ex:
+                if "Directory not found" not in str(ex):
+                    logger.error("Unable to listPath " + relative_dir_path + ", Error: " + str(ex))
+
+                self.conn.createDirectory(self.smbShareName, relative_dir_path)
+
+        except Exception as ex:
+            raise Exception(f"Error creating remote directory: {sub_dir_path} on {remoteDir}" + str(ex))
+
+    def __enumerate_files(self, localDir: str) -> [[list], [list]]:
+        dirList: list = []
+        fileList: list = []
+        try:
+            for root, dirs, files in os.walk(localDir):
+                for d in dirs:
+                    dirList.append(os.path.join(root, d).replace(os.path.join(localDir, ""), ""))
+
+                for file in files:
+                    fileList.append(os.path.join(root, file).replace(os.path.join(localDir, ""), ""))
+        except Exception as ex:
+            logger.warning("Failed to store file list. Error: " + str(ex))
+
+        return dirList, fileList
+
+    def __upload_file(self, localDir: str, remoteDir: str, filename: str) -> None:
+
+        if remoteDir.startswith(self.smbShareName):
+            remoteDir = remoteDir.replace(self.smbShareName, '', 1)
+
+        remotePath = os.path.join(self.smbDstFolderPrefix, remoteDir, filename).replace("/", "\\")
+        localPath = os.path.join(localDir, filename)
+        local_file_size = os.path.getsize(localPath)
+        remaining_attempts = 3
+        smbcopy_needs_to_be_repeated = True
+
+        while smbcopy_needs_to_be_repeated and remaining_attempts > 0:
+            remaining_attempts -= 1
+            try:
+                with open(localPath, 'rb') as file_obj:
+                    remote_file_size = self.conn.storeFile(self.smbShareName, remotePath, file_obj, timeout=120)
+                    file_obj.close()
+
+            except Exception as ex:
+                logger.error("Unable to store file: " + remotePath + ". Error: " + str(ex))
+                return
+
+            if local_file_size == remote_file_size:
+                smbcopy_needs_to_be_repeated = False
+                break
+
+        if smbcopy_needs_to_be_repeated:
+            raise RuntimeError(
+                "Smb Copy indicated that it needs to be repeated, but repeating it several times did not help."
+            )
+
+    def copy_from(self, localDir: str, remoteDir: str):
+
+        try:
+            self.__open_connection()
+            if self.isConnected == False:
+                logger.warning("SMB connection failure!")
+                return
+
+            dirList, fileList = self.__enumerate_files(localDir)
+            for dirname in dirList:
+                self.__create_remote_directory(remoteDir, dirname)
+
+            for filename in fileList:
+                self.__upload_file(localDir, remoteDir, filename)
+        finally:
+            self.__close_connection()
+
+    def __close_connection(self) -> None:
+        try:
+            if self.conn and self.isConnected == True:
+                self.conn.close()
+                logger.info("SMB connection disconnected!")
+        except Exception as ex:
+            logger.error("Unable to close SMB connection. Error: " + str(ex))
